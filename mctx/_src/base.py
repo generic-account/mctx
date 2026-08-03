@@ -79,6 +79,11 @@ QTransform = Callable[[tree.Tree, chex.Array], chex.Array]
 LoopFn = Callable[
     [int, int, Callable[[Any, Any], Any], Tuple[chex.PRNGKey, tree.Tree]],
     Tuple[chex.PRNGKey, tree.Tree]]
+# ScanFn has the same interface as jax.lax.scan. Policies that consume the
+# simulation budget with a scan (instead of a fori_loop over simulations) accept
+# one of these so that Haiku users can pass hk.scan, the way LoopFn exists for
+# hk.fori_loop.
+ScanFn = Callable[..., Tuple[Any, Any]]
 
 T = TypeVar("T")
 
