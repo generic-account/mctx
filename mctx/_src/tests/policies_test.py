@@ -19,6 +19,7 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import mctx
+from mctx._src import action_selection
 from mctx._src import policies
 import numpy as np
 
@@ -131,7 +132,7 @@ class PoliciesTest(absltest.TestCase):
     """Tests action masking."""
     logits = jnp.array([1e6, -jnp.inf, 1e6 + 1, -100.0])
     invalid_actions = jnp.array([0.0, 1.0, 0.0, 1.0])
-    masked_logits = policies._mask_invalid_actions(
+    masked_logits = action_selection.mask_invalid_actions(
         logits, invalid_actions)
     valid_probs = jax.nn.softmax(jnp.array([0.0, 1.0]))
     np.testing.assert_allclose(
@@ -142,7 +143,7 @@ class PoliciesTest(absltest.TestCase):
     """Tests a state with no valid action."""
     logits = jnp.array([-jnp.inf, -jnp.inf, -jnp.inf, -jnp.inf])
     invalid_actions = jnp.array([1.0, 1.0, 1.0, 1.0])
-    masked_logits = policies._mask_invalid_actions(
+    masked_logits = action_selection.mask_invalid_actions(
         logits, invalid_actions)
     np.testing.assert_allclose(
         jnp.array([0.25, 0.25, 0.25, 0.25]),

@@ -202,6 +202,21 @@ def gumbel_muzero_interior_action_selection(
   return jnp.argmax(to_argmax, axis=-1).astype(jnp.int32)
 
 
+def mask_invalid_actions(
+    logits: chex.Array,
+    invalid_actions: Optional[chex.Array]) -> chex.Array:
+  """Returns logits with zero mass to invalid actions."""
+  if invalid_actions is None:
+    return logits
+  chex.assert_equal_shape([logits, invalid_actions])
+  logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+  # At the end of an episode, all actions can be invalid. A softmax would then
+  # produce NaNs, if using -inf for the logits. We avoid the NaNs by using
+  # a finite `min_logit` for the invalid actions.
+  min_logit = jnp.finfo(logits.dtype).min
+  return jnp.where(invalid_actions, min_logit, logits)
+
+
 def masked_argmax(
     to_argmax: chex.Array,
     invalid_actions: Optional[chex.Array]) -> chex.Array:

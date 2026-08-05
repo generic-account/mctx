@@ -1,90 +1,4 @@
-"""Batched sequential halving for Gumbel MuZero: a wave-parallel policy.
-
-The observation (see docs/JAX_REBASE_SCOPE.md and the mctx feasibility study):
-`mctx.gumbel_muzero_policy` runs `num_simulations` strictly sequential
-simulation steps, each costing one `[B]` `recurrent_fn` call plus a round of
-small tree ops. But Sequential Halving visits the considered root actions in
-*rounds* (visit every currently-considered action once, halve, repeat), and
-within a round the visits are independent:
-
-  * the set visited in a round is exactly {actions with visit_count == cv};
-  * each visit descends only into its own root-action subtree;
-  * root-level backups are commutative (count-weighted mean).
-
-So the per-simulation loop can be regrouped into one batched `recurrent_fn`
-call of shape `[B * K_round]` per round — `num_simulations=32,
-max_num_considered_actions=16` collapses from 32 sequential network/env calls
-to 4 — while building the *same tree* (up to floating-point summation order
-within a round) and therefore preserving Gumbel's policy-improvement guarantee
-and mctx's training targets.
-
-v2 additionally collapses the *tree ops* within a round from K-sequential to
-wave-parallel (v1 batched only the recurrent_fn call):
-
-  * descent: read-only on the round's tree snapshot, so all K lanes descend
-    with one nested-vmap `[K, B]` lockstep while_loop instead of K calls;
-  * node writes: the K new nodes and the K (parent, action) edges are distinct
-    on-schedule, so the K per-array scatters fuse into ONE `[B*K]`-wide scatter
-    per tree array (mirroring mctx's `update_tree_node` + `expand` tail);
-  * backups: the K leaf->root paths are disjoint except at the root. One
-    lockstep `[B, K]` scan walks all lanes up at once, recording per hop the
-    (parent, action, propagated leaf_value, updated child value); non-root
-    stats are then written with disjoint scatters, visit counts with
-    scatter-adds, and the root value with the associative closed form
-    v_new = (v*n + sum_k leaf_k) / (n + K) — mathematically identical to
-    mctx's K sequential incremental means (fp summation order differs at the
-    root only; root selection reads raw_values/children stats, not
-    node_values, so visit counts still match mctx exactly).
-
-`batched_gumbel_muzero_policy` below mirrors the `mctx.gumbel_muzero_policy`
-signature and returns a real `mctx.PolicyOutput` over a real `mctx` tree; it
-depends only on jax + mctx internals (no project code), so it can be upstreamed.
-
-Known divergences from mctx (documented, tested — both are properties of the
-per-ROUND regrouping present since v1, not of the v2 op batching):
-
-  1. mctx shrinks the halving schedule per batch row when a row has fewer than
-     `max_num_considered_actions` valid actions. Rounds here are static-width;
-     rows with fewer valid actions re-visit their best valid action for the
-     surplus slots (mctx itself re-expands nodes at max_depth similarly).
-     This only affects rows near terminal states.
-  2. mctx recomputes the root completed-Q transform after EVERY simulation, so
-     within a halving round (2w candidates at the considered visit level, only
-     w visits) the transform's global terms (visit_scale via max visits,
-     rescale min/max, mixed value) drift between picks and mctx's sequential
-     argmax can select a different w-subset than the round-start top-w used
-     here. The visited SET can then differ on near-tied candidates (likelier
-     for untrained networks whose Q-values are nearly equal). Rounds that
-     visit ALL candidates at the level (extra-visit rounds, and round 0 where
-     all candidates share the mixed completed value) are order-independent and
-     exact. With a drift-free qtransform (e.g. value_scale=0) the whole search
-     matches mctx's visit counts exactly — see tests_fast_search_v2.py.
-
-Upstreaming status (see docs/MCTX_BATCHED_GUMBEL_PR.md)
--------------------------------------------------------
-This module is deliberately kept FREE of project imports — only jax + mctx —
-so it can be lifted into mctx unchanged. Validated against mctx `main`
-@ 450fbf76 (2026-07-09): every `_src` difference from the pinned 0.0.71 release
-is a `# pyrefly: ignore[...]` type-suppression comment, and the public API is
-byte-identical, so the code below applies to upstream as-is. (PyPI's newest
-mctx IS 0.0.71; the "Release v0.1.9" commit on main never published — no git
-tag, and a "Fix the pypi release hook" commit followed it.)
-
-Relationship to mctx PR #116 ("Avoid full-buffer copies in the backward pass"):
-that PR independently arrived at the same path-recording + single-scatter
-technique used in `_backward_batched` below, for the same reason (XLA copying
-whole `[num_nodes, num_actions]` buffers per loop iteration). Theirs is the
-SINGLE-leaf case, where each node has exactly one visitor on the path, so
-plain `.set()` scatters are correct. Round batching needs the K-leaf
-generalization: K lanes share the root (and any common ancestor), so visit
-counts become scatter-ADDs and the root value uses the associative closed
-form. Round batching also buys a tighter footprint than #116 can get — a leaf
-expanded in round r sits at depth <= r+1, so the path scan is bounded by a
-static `num_hops` instead of `[num_nodes]` scratch. The two changes are
-orthogonal and compose: #116 attacks per-simulation buffer copies, this module
-attacks the number of sequential `recurrent_fn` calls.
-"""
-
+"""A wave-parallel Gumbel MuZero policy."""
 import functools
 from typing import Optional
 
@@ -93,7 +7,6 @@ import jax
 import jax.numpy as jnp
 from mctx._src import action_selection
 from mctx._src import base
-from mctx._src import policies
 from mctx._src import qtransforms
 from mctx._src import search
 from mctx._src import seq_halving
@@ -102,22 +15,12 @@ from mctx._src import tree as tree_lib
 Tree = tree_lib.Tree
 
 
-def _mask_invalid_actions(logits, invalid_actions):
-  """Delegates to `policies._mask_invalid_actions`.
-
-  Reused rather than re-implemented so the two Gumbel policies can never drift
-  apart on the masking convention; a maintainer may prefer to promote that
-  helper to a shared module.
-  """
-  return policies._mask_invalid_actions(logits, invalid_actions)  # pylint: disable=protected-access
-
-
 def _rounds_from_schedule(max_num_considered_actions, num_simulations):
   """Run-length encodes the visit schedule into (considered_visit, width).
 
-    Derived from mctx's own `get_sequence_of_considered_visits`, so the phase
-    widths (including the max(2, m//2) and extra-visit quirks) match exactly.
-    """
+  Derived from mctx's own `get_sequence_of_considered_visits`, so the phase
+  widths (including the max(2, m//2) and extra-visit quirks) match exactly.
+  """
   seq = seq_halving.get_sequence_of_considered_visits(
       max_num_considered_actions, num_simulations)
   rounds = []
@@ -136,13 +39,13 @@ def _write_nodes_batched(tree, edge_rec, batch_f, parent_f, action_f, next_f,
                          embedding_f):
   """The tail of mctx.search.expand + update_tree_node, for a whole round.
 
-    All arguments are flat `[B*K]` (b-major); the K new node indices per row
-    are distinct and the K (parent, action) edges per row are distinct
-    on-schedule, so each of mctx's K sequential per-array scatters collapses
-    into one K-wide scatter. `node_visits` uses `.add` (identical to mctx's
-    read-modify-write `set(old+1)` for distinct indices, and correct for the
-    documented off-schedule duplicate re-expansions where `set` would race).
-    """
+  All arguments are flat `[B*K]` (b-major); the K new node indices per row
+  are distinct and the K (parent, action) edges per row are distinct
+  on-schedule, so each of mctx's K sequential per-array scatters collapses
+  into one K-wide scatter. `node_visits` uses `.add` (identical to mctx's
+  read-modify-write `set(old+1)` for distinct indices, and correct for the
+  documented off-schedule duplicate re-expansions where `set` would race).
+  """
   return tree.replace(
       # update_tree_node fields (at the new nodes).
       children_prior_logits=tree.children_prior_logits.at[batch_f, next_f].set(
@@ -178,30 +81,30 @@ def _write_nodes_batched(tree, edge_rec, batch_f, parent_f, action_f, next_f,
 def _backward_batched(tree, edge_rec, leaf_indices, num_hops):
   """mctx.search.backward for K leaves per batch row at once.
 
-    Structure and naming deliberately mirror mctx PR #116 (`path_*` arrays
-    recorded in the loop carry, then ONE scatter per tree array with
-    `mode="drop"` for unused slots) so this reads as that function generalized
-    to K lanes. The generalization is forced by round batching: K lanes share
-    the root, so visit counts must be scatter-ADDs rather than #116's `.set()`,
-    and the root value uses the associative closed form. In exchange, the path
-    scan is bounded by a static `num_hops` (a leaf expanded in round r is at
-    depth <= r+1) instead of `[num_nodes]` scratch.
+  Structure and naming deliberately mirror mctx PR #116 (`path_*` arrays
+  recorded in the loop carry, then ONE scatter per tree array with
+  `mode="drop"` for unused slots) so this reads as that function generalized
+  to K lanes. The generalization is forced by round batching: K lanes share
+  the root, so visit counts must be scatter-ADDs rather than #116's `.set()`,
+  and the root value uses the associative closed form. In exchange, the path
+  scan is bounded by a static `num_hops` (a leaf expanded in round r is at
+  depth <= r+1) instead of `[num_nodes]` scratch.
 
-    Walks all `[B, K]` lanes leaf->root in lockstep for `num_hops` hops
-    (a static bound on the max leaf depth this round), recording per hop the
-    (parent, action, propagated leaf_value, updated child value). The K paths
-    are disjoint except at the root, so:
+  Walks all `[B, K]` lanes leaf->root in lockstep for `num_hops` hops
+  (a static bound on the max leaf depth this round), recording per hop the
+  (parent, action, propagated leaf_value, updated child value). The K paths
+  are disjoint except at the root, so:
 
-      * non-root `node_values` and `children_values` follow mctx's exact
-        single-visitor expressions (bitwise identical on-schedule);
-      * visit counts are scatter-adds (exact, integer);
-      * the root value uses the associative closed form
-        (v*n + sum_k leaf_k) / (n + K), equal to mctx's K sequential
-        incremental means up to fp summation order.
+    * non-root `node_values` and `children_values` follow mctx's exact
+      single-visitor expressions (bitwise identical on-schedule);
+    * visit counts are scatter-adds (exact, integer);
+    * the root value uses the associative closed form
+      (v*n + sum_k leaf_k) / (n + K), equal to mctx's K sequential
+      incremental means up to fp summation order.
 
-    Lanes whose paths are shorter than `num_hops` are masked by routing their
-    scatter indices out of bounds (`mode="drop"`).
-    """
+  Lanes whose paths are shorter than `num_hops` are masked by routing their
+  scatter indices out of bounds (`mode="drop"`).
+  """
   batch_size = leaf_indices.shape[0]
   num_nodes = tree.node_values.shape[1]
   b_idx = jnp.arange(batch_size)[:, None]  # [B, 1], broadcasts over K
@@ -290,27 +193,27 @@ def _completed_q_and_score_subset(tree,
                                   maxvisit_init=50.0,
                                   epsilon=1e-8):
   """Bit-identical `score_considered(considered_visit, ...)` over a column
-    subset, for the DEFAULT `qtransform_completed_by_mix_value`
-    (value_scale=0.1,
-    maxvisit_init=50, rescale_values=True, use_mixed_value=True, epsilon=1e-8).
+  subset, for the DEFAULT `qtransform_completed_by_mix_value`
+  (value_scale=0.1,
+  maxvisit_init=50, rescale_values=True, use_mixed_value=True, epsilon=1e-8).
 
-    Rounds 1+ of Sequential Halving only ever consider actions with
-    `visit == considered_visit >= 1`; those are always a subset of the round-0
-    top-m `considered` set (the only root actions the search ever visits), and
-    every other action scores `-inf` (score_considered's penalty) so it can
-    never enter the top-k. So the full-1393-wide `vmap(qtransform)` +
-    `score_considered` collapse to work over the `[B, m]` `considered` columns.
+  Rounds 1+ of Sequential Halving only ever consider actions with
+  `visit == considered_visit >= 1`; those are always a subset of the round-0
+  top-m `considered` set (the only root actions the search ever visits), and
+  every other action scores `-inf` (score_considered's penalty) so it can
+  never enter the top-k. So the full-1393-wide `vmap(qtransform)` +
+  `score_considered` collapse to work over the `[B, m]` `considered` columns.
 
-    Reproduces mctx's global terms from the subset (see qtransforms.py):
-      * root prior softmax and gumbel are STATIC across rounds; passed in
-        already gathered at `considered`.
-      * every `considered` action stays visited>0 the whole search, so the
-        completed array is {qvalue[considered]} plus the mixed value at the
-        (always >= 1, since 1393 >> m) unvisited actions; hence the full-width
-        rescale min/max reduce to min/max over (qvalue[considered], mixed) and
-        `max(visit_counts)` reduces to the max over `considered`.
-      * score_considered subtracts the FULL-width logit max (`logit_max_full`).
-    """
+  Reproduces mctx's global terms from the subset (see qtransforms.py):
+    * root prior softmax and gumbel are STATIC across rounds; passed in
+      already gathered at `considered`.
+    * every `considered` action stays visited>0 the whole search, so the
+      completed array is {qvalue[considered]} plus the mixed value at the
+      (always >= 1, since 1393 >> m) unvisited actions; hence the full-width
+      rescale min/max reduce to min/max over (qvalue[considered], mixed) and
+      `max(visit_counts)` reduces to the max over `considered`.
+    * score_considered subtracts the FULL-width logit max (`logit_max_full`).
+  """
   b = batch_range[:, None]
   # qvalues over the considered columns: rewards + discount * value at ROOT.
   q = (tree.children_rewards[b, Tree.ROOT_INDEX, considered] +
@@ -348,14 +251,14 @@ def _completed_q_and_score_subset(tree,
 
 def _make_forced_simulate(interior_fn):
   """A vmapped tree-descent like mctx.search.simulate, but the depth-0 (root)
-    action is a per-batch input instead of coming from a selection function —
-    the round's considered action. Body mirrors mctx._src.search.simulate.
+  action is a per-batch input instead of coming from a selection function —
+  the round's considered action. Body mirrors mctx._src.search.simulate.
 
-    Doubly vmapped `[K, B]`: descent is read-only on the round's tree snapshot
-    and the K considered subtrees are disjoint below the root (the root action
-    is forced), so all K lanes run one lockstep while_loop over a broadcast
-    tree instead of K sequential descents.
-    """
+  Doubly vmapped `[K, B]`: descent is read-only on the round's tree snapshot
+  and the K considered subtrees are disjoint below the root (the root action
+  is forced), so all K lanes run one lockstep while_loop over a broadcast
+  tree instead of K sequential descents.
+  """
 
   @functools.partial(jax.vmap, in_axes=[0, None, 0, None], out_axes=0)  # K
   @functools.partial(jax.vmap, in_axes=[0, 0, 0, None], out_axes=0)  # B
@@ -424,57 +327,86 @@ def batched_gumbel_muzero_policy(
 ) -> base.PolicyOutput[action_selection.GumbelMuZeroExtraData]:
   """Runs wave-parallel Gumbel MuZero search and returns the `PolicyOutput`.
 
-    A drop-in alternative to `gumbel_muzero_policy` that builds the same tree
-    with far fewer `recurrent_fn` calls, by regrouping Sequential Halving's
-    per-simulation visit schedule into rounds and evaluating each round in one
-    batched call. See the module docstring for the exactness contract.
+  A drop-in alternative to `gumbel_muzero_policy` that builds the same tree
+  with far fewer `recurrent_fn` calls. Sequential Halving visits root actions
+  in rounds: consecutive simulations sharing a considered-visit level visit
+  distinct root actions, and their subtrees are disjoint below the root, so
+  they are independent. This policy run-length-encodes the same visit schedule
+  into `(considered_visit, width)` rounds and evaluates each round with one
+  `recurrent_fn` call. Rounds sharing a width run under a single `scan_fn`, so
+  the graph size stays nearly flat as `num_simulations` grows.
 
-    `recurrent_fn` must be shape-polymorphic in its leading (batch) dimension:
-    it is called with batch `B * width` instead of `B`, where `width` is the
-    number of root actions visited in the round. Any vmapped `recurrent_fn`
-    (the common case) satisfies this.
+  Numerical equivalence to `gumbel_muzero_policy`:
 
-    Args:
-      params: params to be forwarded to root and recurrent functions.
-      rng_key: random number generator state, the key is consumed.
-      root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
-        `prior_logits` are from a policy network. The shapes are
-        `([B, num_actions], [B], [B, ...])`, respectively.
-      recurrent_fn: a callable to be called on the leaf nodes and unvisited
-        actions retrieved by the simulation step, which takes as args
-        `(params, rng_key, action, embedding)` and returns a
-        `RecurrentFnOutput` and the new state embedding. It is called once per
-        round with a batch of `B * width`.
-      num_simulations: the number of simulations.
-      invalid_actions: a mask with invalid actions. Invalid actions have ones,
-        valid actions have zeros in the mask. Shape `[B, num_actions]`.
-      max_depth: maximum search tree depth allowed during simulation.
-      loop_fn: accepted for signature parity with `gumbel_muzero_policy`. This
-        policy has no per-simulation `fori_loop` to parameterize — the budget is
-        consumed by `scan_fn` over rounds — so passing a non-default value is an
-        error rather than being silently ignored. Use `scan_fn` instead.
-      qtransform: function to obtain completed Q-values for a node.
-      max_num_considered_actions: the maximum number of actions expanded at the
-        root node. A smaller number of actions will be expanded if the number of
-        valid actions is smaller.
-      gumbel_scale: scale for the Gumbel noise. Evalution on perfect-information
-        games can use gumbel_scale=0.0.
-      scan_fn: function used to run the rounds, with the interface of
-        `jax.lax.scan`. Pass `hk.scan` when calling this policy inside a Haiku
-        module, for the same reason `LoopFn` exists for `hk.fori_loop`.
-      max_lanes_per_call: if set, an upper bound on how many root actions share
-        a single `recurrent_fn` call. A round of `width` actions is then split
-        into `ceil(width / max_lanes_per_call)` sequential calls of at most
-        `[B * max_lanes_per_call]`. Use this when the `w`-fold larger batch
-        would exhaust accelerator memory; `max_lanes_per_call=1` reproduces
-        `gumbel_muzero_policy`'s per-call memory profile. Every chunk receives
-        the same `rng_key`, exactly as the unsplit call does, so chunking is
-        exact for any `recurrent_fn` that does not draw shape-dependent noise.
+    * node allocation, non-root backups and visit counts are bitwise
+      identical; the root's count-weighted mean uses the associative closed
+      form `(v * n + sum_k leaf_k) / (n + width)`, so it differs only in
+      floating-point summation order. Root selection reads `raw_values` and
+      the children statistics rather than `node_values`, so that reordering
+      cannot change which actions are visited.
+    * with a drift-free `qtransform` (`value_scale=0`, so root scores do not
+      depend on backed-up Q-values) the visit counts and the chosen action
+      match exactly.
+    * with the default `qtransform` two documented differences remain. First,
+      `gumbel_muzero_policy` shrinks its schedule per row via
+      `min(max_num_considered_actions, num_valid_actions)`; rounds here have a
+      static width, so a row with fewer valid actions re-visits its best valid
+      action for the surplus slots. Second, `gumbel_muzero_policy` recomputes
+      the completed Q-values after every simulation, so within a halving round
+      its sequential argmax can pick a different subset than this round-start
+      `top_k` when candidates are near-tied. Such halving rounds number
+      `log2(max_num_considered_actions) - 1` and are constant in the
+      simulation budget, while the total round count grows with it: rounds
+      that visit every eligible candidate, and round 0 (where every action is
+      unvisited, so the completed Q-values are identically zero), are
+      order-independent.
 
-    Returns:
-      `PolicyOutput` containing the proposed action, action_weights and the used
-      search tree.
-    """
+  `recurrent_fn` must be shape-polymorphic in its leading (batch) dimension:
+  it is called with batch `B * width` instead of `B`, where `width` is the
+  number of root actions visited in the round. Any vmapped `recurrent_fn`
+  (the common case) satisfies this.
+
+  Args:
+    params: params to be forwarded to root and recurrent functions.
+    rng_key: random number generator state, the key is consumed.
+    root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
+      `prior_logits` are from a policy network. The shapes are
+      `([B, num_actions], [B], [B, ...])`, respectively.
+    recurrent_fn: a callable to be called on the leaf nodes and unvisited
+      actions retrieved by the simulation step, which takes as args
+      `(params, rng_key, action, embedding)` and returns a
+      `RecurrentFnOutput` and the new state embedding. It is called once per
+      round with a batch of `B * width`.
+    num_simulations: the number of simulations.
+    invalid_actions: a mask with invalid actions. Invalid actions have ones,
+      valid actions have zeros in the mask. Shape `[B, num_actions]`.
+    max_depth: maximum search tree depth allowed during simulation.
+    loop_fn: accepted for signature parity with `gumbel_muzero_policy`. This
+      policy has no per-simulation `fori_loop` to parameterize — the budget is
+      consumed by `scan_fn` over rounds — so passing a non-default value is an
+      error rather than being silently ignored. Use `scan_fn` instead.
+    qtransform: function to obtain completed Q-values for a node.
+    max_num_considered_actions: the maximum number of actions expanded at the
+      root node. A smaller number of actions will be expanded if the number of
+      valid actions is smaller.
+    gumbel_scale: scale for the Gumbel noise. Evalution on perfect-information
+      games can use gumbel_scale=0.0.
+    scan_fn: function used to run the rounds, with the interface of
+      `jax.lax.scan`. Pass `hk.scan` when calling this policy inside a Haiku
+      module, for the same reason `LoopFn` exists for `hk.fori_loop`.
+    max_lanes_per_call: if set, an upper bound on how many root actions share
+      a single `recurrent_fn` call. A round of `width` actions is then split
+      into `ceil(width / max_lanes_per_call)` sequential calls of at most
+      `[B * max_lanes_per_call]`. Use this when the `w`-fold larger batch
+      would exhaust accelerator memory; `max_lanes_per_call=1` reproduces
+      `gumbel_muzero_policy`'s per-call memory profile. Every chunk receives
+      the same `rng_key`, exactly as the unsplit call does, so chunking is
+      exact for any `recurrent_fn` that does not draw shape-dependent noise.
+
+  Returns:
+    `PolicyOutput` containing the proposed action, action_weights and the used
+    search tree.
+  """
   if loop_fn is not jax.lax.fori_loop:
     raise ValueError(
         "batched_gumbel_muzero_policy has no per-simulation fori_loop to "
@@ -490,7 +422,7 @@ def batched_gumbel_muzero_policy(
 
   # Same masking + gumbel sampling (and rng consumption order) as mctx, so
   # results are directly comparable under the same rng_key.
-  root = root.replace(prior_logits=_mask_invalid_actions(
+  root = root.replace(prior_logits=action_selection.mask_invalid_actions(
       root.prior_logits, invalid_actions))
   rng_key, gumbel_rng = jax.random.split(rng_key)
   gumbel = gumbel_scale * jax.random.gumbel(
@@ -535,8 +467,8 @@ def batched_gumbel_muzero_policy(
 
   def _score_full_width(tree_, considered_visit):
     """mctx's own root scoring at full action width. Used for round 0 and
-        for any qtransform other than the default (where the O(m) subset
-        derivation in `_completed_q_and_score_subset` does not apply)."""
+    for any qtransform other than the default (where the O(m) subset
+    derivation in `_completed_q_and_score_subset` does not apply)."""
     summary_visits = tree_.children_visits[:, Tree.ROOT_INDEX]
     completed_q = jax.vmap(qtransform, in_axes=[0, None])(tree_,
                                                           Tree.ROOT_INDEX)
@@ -546,9 +478,9 @@ def batched_gumbel_muzero_policy(
   def _run_round(tree_, edge_rec_, rng_key_, sim_offset_, considered_visit,
                  width, num_hops, subset_state):
     """One halving round. `width` and `num_hops` must be STATIC (they set
-        array shapes and the backward scan length); `considered_visit` and
-        `sim_offset_` may be traced, which is what lets same-width rounds share
-        one traced body under `lax.scan`."""
+    array shapes and the backward scan length); `considered_visit` and
+    `sim_offset_` may be traced, which is what lets same-width rounds share
+    one traced body under `lax.scan`."""
     if subset_state is None:
       scores = _score_full_width(tree_, considered_visit)
     else:
@@ -704,7 +636,7 @@ def batched_gumbel_muzero_policy(
                                            root.prior_logits, completed_qvalues,
                                            summary.visit_counts)
   action = action_selection.masked_argmax(to_argmax, invalid_actions)
-  completed_search_logits = _mask_invalid_actions(
+  completed_search_logits = action_selection.mask_invalid_actions(
       root.prior_logits + completed_qvalues, invalid_actions)
   action_weights = jax.nn.softmax(completed_search_logits)
   return base.PolicyOutput(action=action,
