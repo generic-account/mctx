@@ -1,6 +1,7 @@
 """A wave-parallel Gumbel MuZero policy."""
 import functools
-from typing import Optional
+import itertools
+from typing import Optional, Sequence, Tuple
 
 import chex
 import jax
@@ -15,67 +16,137 @@ from mctx._src import tree as tree_lib
 Tree = tree_lib.Tree
 
 
-def _rounds_from_schedule(max_num_considered_actions, num_simulations):
-  """Run-length encodes the visit schedule into (considered_visit, width).
-
-  Derived from mctx's own `get_sequence_of_considered_visits`, so the phase
-  widths (including the max(2, m//2) and extra-visit quirks) match exactly.
-  """
+def _rounds_from_schedule(
+    max_num_considered_actions: int,
+    num_simulations: int) -> Sequence[Tuple[int, int]]:
+  """Run-length encodes the visit schedule into (considered_visit, width)."""
   seq = seq_halving.get_sequence_of_considered_visits(
       max_num_considered_actions, num_simulations)
-  rounds = []
-  i = 0
-  while i < len(seq):
-    j = i
-    while j < len(seq) and seq[j] == seq[i]:
-      j += 1
-    rounds.append((seq[i], j - i))
-    i = j
-  return rounds
+  return [(considered_visit, sum(1 for _ in group))
+          for considered_visit, group in itertools.groupby(seq)]
 
 
-def _write_nodes_batched(tree, edge_rec, batch_f, parent_f, action_f, next_f,
-                         prior_logits_f, value_f, reward_f, discount_f,
-                         embedding_f):
-  """The tail of mctx.search.expand + update_tree_node, for a whole round.
+def _write_nodes_batched(
+    tree: Tree,
+    batch_index: chex.Array,
+    parent_index: chex.Array,
+    action: chex.Array,
+    node_index: chex.Array,
+    step: base.RecurrentFnOutput,
+    embedding: chex.ArrayTree) -> Tree:
+  """`expand` and `update_tree_node`, for a whole round at once.
 
-  All arguments are flat `[B*K]` (b-major); the K new node indices per row
-  are distinct and the K (parent, action) edges per row are distinct
-  on-schedule, so each of mctx's K sequential per-array scatters collapses
-  into one K-wide scatter. `node_visits` uses `.add` (identical to mctx's
-  read-modify-write `set(old+1)` for distinct indices, and correct for the
-  documented off-schedule duplicate re-expansions where `set` would race).
+  New node indices per row are distinct, so per-sim scatter order
+  is irrelevant and they can be collapsed into one
+
+  Args:
+    tree: the `Tree` to write into.
+    batch_index: the row of each write. Shape `[B * width]`.
+    parent_index: the node expanded from. Shape `[B * width]`.
+    action: the action taken from `parent_index`. Shape `[B * width]`.
+    node_index: the index of the newly expanded node. Shape `[B * width]`.
+    step: the `RecurrentFnOutput` for those nodes. `prior_logits` has shape
+      `[B * width, num_actions]`, the rest `[B * width]`.
+    embedding: the state embeddings for the new nodes. Shape `[B * width, ...]`.
+
+  Returns:
+    The tree with this round's nodes and edges written.
   """
+  # The four index arrays address one round's writes and must travel together;
+  # rank 1 states that they are flattened, not still [B, width].
+  chex.assert_rank(node_index, 1)
+  chex.assert_equal_shape([batch_index, parent_index, action, node_index])
+  # `step` comes from the caller's `recurrent_fn`, so its shapes are the ones
+  # genuinely worth checking. Same set as `search.expand` asserts.
+  flat_size = node_index.shape[0]
+  chex.assert_shape(step.prior_logits, [flat_size, tree.num_actions])
+  chex.assert_shape(step.reward, [flat_size])
+  chex.assert_shape(step.discount, [flat_size])
+  chex.assert_shape(step.value, [flat_size])
   return tree.replace(
-      # update_tree_node fields (at the new nodes).
-      children_prior_logits=tree.children_prior_logits.at[batch_f, next_f].set(
-          prior_logits_f),
-      raw_values=tree.raw_values.at[batch_f, next_f].set(value_f),
-      node_values=tree.node_values.at[batch_f, next_f].set(value_f),
-      node_visits=tree.node_visits.at[batch_f, next_f].add(1),
+      # `update_tree_node` fields, at the new nodes.
+      children_prior_logits=tree.children_prior_logits.at[
+          batch_index, node_index].set(step.prior_logits),
+      raw_values=tree.raw_values.at[batch_index, node_index].set(step.value),
+      node_values=tree.node_values.at[batch_index, node_index].set(step.value),
+      # node_visits uses .add to prevent races
+      node_visits=tree.node_visits.at[batch_index, node_index].add(1),
       embeddings=jax.tree_util.tree_map(
-          lambda t, s: t.at[batch_f, next_f].set(s), tree.embeddings,
-          embedding_f),
-      # expand tail fields (at the (parent, action) edges / new nodes).
-      children_index=tree.children_index.at[batch_f, parent_f,
-                                            action_f].set(next_f),
-      children_rewards=tree.children_rewards.at[batch_f, parent_f,
-                                                action_f].set(reward_f),
-      children_discounts=tree.children_discounts.at[batch_f, parent_f,
-                                                    action_f].set(discount_f),
-      parents=tree.parents.at[batch_f, next_f].set(parent_f),
-      action_from_parent=tree.action_from_parent.at[batch_f,
-                                                    next_f].set(action_f),
-  ), edge_rec.at[batch_f, next_f].set(
-      jnp.stack([
-          parent_f.astype(jnp.float32),
-          action_f.astype(jnp.float32), reward_f, discount_f
-      ],
-                axis=-1))
-  # edge_rec [B, N, 4]: (parent, action, reward, discount) per node — a
-  # read-optimized mirror for the backward walk: ONE 16-byte row gather per
-  # hop instead of four 4-byte element gathers (each billed a full memory
-  # transaction). parent/action are exact in f32 (< 2^24).
+          lambda t, s: t.at[batch_index, node_index].set(s),
+          tree.embeddings, embedding),
+      parents=tree.parents.at[batch_index, node_index].set(parent_index),
+      action_from_parent=tree.action_from_parent.at[
+          batch_index, node_index].set(action),
+      # `expand` tail fields, at the (parent, action) edges.
+      children_index=tree.children_index.at[
+          batch_index, parent_index, action].set(node_index),
+      children_rewards=tree.children_rewards.at[
+          batch_index, parent_index, action].set(step.reward),
+      children_discounts=tree.children_discounts.at[
+          batch_index, parent_index, action].set(step.discount))
+
+
+def _write_edge_record(
+    edge_rec: chex.Array,
+    batch_index: chex.Array,
+    parent_index: chex.Array,
+    action: chex.Array,
+    node_index: chex.Array,
+    step: base.RecurrentFnOutput) -> chex.Array:
+  """Maintains the read-optimized edge mirror consumed by `_backward_batched`.
+
+  `edge_rec` is `[B, num_nodes, 4]`, holding `(parent, action, reward,
+  discount)` for the edge that reaches each node. The backward walk needs
+  exactly those four values per hop; reading them from the tree would cost four
+  separate element gathers, two of them into the `[B, num_nodes, num_actions]`
+  children tables. Keeping this mirror turns that into one 16-byte row gather.
+
+  Two choices here are load-bearing, both measured on a v5e-4 at
+  `num_actions=1393` over three shapes (medians, run-to-run spread <= 1.7%):
+
+    * Keeping a mirror at all. Reading `reward`/`discount` straight from
+      `children_rewards`/`children_discounts` needs a double-indexed gather into
+      the `[B, num_nodes, num_actions]` tables every hop, and ran 15-17% slower.
+    * Packing all four values into one row. The two indices are already in the
+      tree as `[B, num_nodes]` arrays, so mirroring only the two floats needs no
+      bit-level casts -- but it costs three gathers per hop instead of one, and
+      ran a further 2.8-3.9% slower.
+
+  Hence int32, with the two indices stored natively and the two floats held as
+  bit patterns for `_read_edge_record` to cast back. A single float32 mirror
+  would also avoid the bitcasts, but converting the indices is lossy above
+  2**24: `action` is bounded only by `num_actions`, which mctx does not cap.
+  """
+  # No shape asserts here. This runs immediately after `_write_nodes_batched`
+  # on the same index arrays, which validates them, and `edge_rec` is allocated
+  # by this module rather than supplied by a caller.
+  def as_bits(x):
+    return jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.int32)
+
+  record = jnp.stack([
+      parent_index.astype(jnp.int32),
+      action.astype(jnp.int32),
+      as_bits(step.reward),
+      as_bits(step.discount),
+  ], axis=-1)
+  return edge_rec.at[batch_index, node_index].set(record)
+
+
+def _read_edge_record(
+    edge_rec: chex.Array,
+    batch_index: chex.Array,
+    node_index: chex.Array) -> Tuple[chex.Array, ...]:
+  """Reads `(parent, action, reward, discount)` for `node_index` in one gather.
+
+  The inverse of `_write_edge_record`: one row gather, then four bitcasts of the
+  stored bit patterns back to their original dtypes.
+  """
+  row = edge_rec[batch_index, node_index]
+
+  def as_float(x):
+    return jax.lax.bitcast_convert_type(x, jnp.float32)
+
+  return row[..., 0], row[..., 1], as_float(row[..., 2]), as_float(row[..., 3])
 
 
 def _backward_batched(tree, edge_rec, leaf_indices, num_hops):
@@ -118,11 +189,8 @@ def _backward_batched(tree, edge_rec, leaf_indices, num_hops):
 
   def hop(carry, _):
     index, leaf_value, child_value, active = carry  # each [B, K]
-    er = edge_rec[b_idx, index]  # [B, K, 4]
-    parent = er[..., 0].astype(jnp.int32)
-    action = er[..., 1].astype(jnp.int32)
-    reward = er[..., 2]
-    discount = er[..., 3]
+    parent, action, reward, discount = _read_edge_record(
+        edge_rec, b_idx, index)
     leaf_value = reward + discount * leaf_value
     is_root = parent == Tree.ROOT_INDEX
     record = (parent, action, leaf_value, child_value, active)
@@ -354,12 +422,14 @@ def batched_gumbel_muzero_policy(
       action for the surplus slots. Second, `gumbel_muzero_policy` recomputes
       the completed Q-values after every simulation, so within a halving round
       its sequential argmax can pick a different subset than this round-start
-      `top_k` when candidates are near-tied. Such halving rounds number
-      `log2(max_num_considered_actions) - 1` and are constant in the
-      simulation budget, while the total round count grows with it: rounds
-      that visit every eligible candidate, and round 0 (where every action is
-      unvisited, so the completed Q-values are identically zero), are
-      order-independent.
+      `top_k` when candidates are near-tied. There are at most
+      `ceil(log2(max_num_considered_actions)) - 1` such rounds -- those
+      where the considered set shrinks -- and that count does not grow with
+      the simulation budget, while the total number of rounds does. Every
+      other round is order-independent: rounds that visit each eligible
+      candidate have no subset to choose, and round 0 leaves every action
+      unvisited, which makes the completed Q-values identically zero and
+      the scores static.
 
   `recurrent_fn` must be shape-polymorphic in its leading (batch) dimension:
   it is called with batch `B * width` instead of `B`, where `width` is the
@@ -433,7 +503,7 @@ def batched_gumbel_muzero_policy(
                                            num_simulations,
                                            root_invalid_actions=invalid_actions,
                                            extra_data=extra_data)
-  edge_rec = jnp.zeros((batch_size, num_simulations + 1, 4), jnp.float32)
+  edge_rec = jnp.zeros((batch_size, num_simulations + 1, 4), jnp.int32)
 
   interior_fn = functools.partial(
       action_selection.gumbel_muzero_interior_action_selection,
@@ -563,11 +633,10 @@ def batched_gumbel_muzero_policy(
       new_embedding_f = _join(emb_parts)
 
     # --- write the round's K nodes with ONE scatter per tree array.
-    tree_, edge_rec_ = _write_nodes_batched(tree_, edge_rec_, batch_f,
-                                            parents_f, actions_f, next_f,
-                                            step.prior_logits, step.value,
-                                            step.reward, step.discount,
-                                            new_embedding_f)
+    tree_ = _write_nodes_batched(tree_, batch_f, parents_f, actions_f, next_f,
+                                 step, new_embedding_f)
+    edge_rec_ = _write_edge_record(edge_rec_, batch_f, parents_f, actions_f,
+                                   next_f, step)
     # --- back up all K lanes at once.
     tree_ = _backward_batched(tree_, edge_rec_, next_idxs, num_hops)
     sim_offset_ = jnp.asarray(sim_offset_ + width, jnp.int32)
