@@ -1,0 +1,713 @@
+"""A wave-parallel Gumbel MuZero policy."""
+import functools
+import itertools
+from typing import Optional, Sequence, Tuple
+
+import chex
+import jax
+import jax.numpy as jnp
+from mctx._src import action_selection
+from mctx._src import base
+from mctx._src import qtransforms
+from mctx._src import search
+from mctx._src import seq_halving
+from mctx._src import tree as tree_lib
+
+Tree = tree_lib.Tree
+
+
+def _rounds_from_schedule(
+    max_num_considered_actions: int,
+    num_simulations: int) -> Sequence[Tuple[int, int]]:
+  """Run-length encodes the visit schedule into (considered_visit, width)."""
+  seq = seq_halving.get_sequence_of_considered_visits(
+      max_num_considered_actions, num_simulations)
+  return [(considered_visit, sum(1 for _ in group))
+          for considered_visit, group in itertools.groupby(seq)]
+
+
+def _write_nodes_batched(
+    tree: Tree,
+    batch_index: chex.Array,
+    parent_index: chex.Array,
+    action: chex.Array,
+    node_index: chex.Array,
+    step: base.RecurrentFnOutput,
+    embedding: chex.ArrayTree) -> Tree:
+  """`expand` and `update_tree_node`, for a whole round at once.
+
+  New node indices per row are distinct, so per-sim scatter order
+  is irrelevant and they can be collapsed into one
+
+  Args:
+    tree: the `Tree` to write into.
+    batch_index: the row of each write. Shape `[B * width]`.
+    parent_index: the node expanded from. Shape `[B * width]`.
+    action: the action taken from `parent_index`. Shape `[B * width]`.
+    node_index: the index of the newly expanded node. Shape `[B * width]`.
+    step: the `RecurrentFnOutput` for those nodes. `prior_logits` has shape
+      `[B * width, num_actions]`, the rest `[B * width]`.
+    embedding: the state embeddings for the new nodes. Shape `[B * width, ...]`.
+
+  Returns:
+    The tree with this round's nodes and edges written.
+  """
+  # The four index arrays address one round's writes and must travel together;
+  # rank 1 states that they are flattened, not still [B, width].
+  chex.assert_rank(node_index, 1)
+  chex.assert_equal_shape([batch_index, parent_index, action, node_index])
+  # `step` comes from the caller's `recurrent_fn`, so its shapes are the ones
+  # genuinely worth checking. Same set as `search.expand` asserts.
+  flat_size = node_index.shape[0]
+  chex.assert_shape(step.prior_logits, [flat_size, tree.num_actions])
+  chex.assert_shape(step.reward, [flat_size])
+  chex.assert_shape(step.discount, [flat_size])
+  chex.assert_shape(step.value, [flat_size])
+  return tree.replace(
+      # `update_tree_node` fields, at the new nodes.
+      children_prior_logits=tree.children_prior_logits.at[
+          batch_index, node_index].set(step.prior_logits),
+      raw_values=tree.raw_values.at[batch_index, node_index].set(step.value),
+      node_values=tree.node_values.at[batch_index, node_index].set(step.value),
+      # node_visits uses .add to prevent races
+      node_visits=tree.node_visits.at[batch_index, node_index].add(1),
+      embeddings=jax.tree_util.tree_map(
+          lambda t, s: t.at[batch_index, node_index].set(s),
+          tree.embeddings, embedding),
+      parents=tree.parents.at[batch_index, node_index].set(parent_index),
+      action_from_parent=tree.action_from_parent.at[
+          batch_index, node_index].set(action),
+      # `expand` tail fields, at the (parent, action) edges.
+      children_index=tree.children_index.at[
+          batch_index, parent_index, action].set(node_index),
+      children_rewards=tree.children_rewards.at[
+          batch_index, parent_index, action].set(step.reward),
+      children_discounts=tree.children_discounts.at[
+          batch_index, parent_index, action].set(step.discount))
+
+
+def _write_edge_record(
+    edge_rec: chex.Array,
+    batch_index: chex.Array,
+    parent_index: chex.Array,
+    action: chex.Array,
+    node_index: chex.Array,
+    step: base.RecurrentFnOutput) -> chex.Array:
+  """Maintains the read-optimized edge mirror consumed by `_backward_batched`.
+
+  `edge_rec` is `[B, num_nodes, 4]`, holding `(parent, action, reward,
+  discount)` for the edge that reaches each node. The backward walk needs
+  exactly those four values per hop; reading them from the tree would cost four
+  separate element gathers, two of them into the `[B, num_nodes, num_actions]`
+  children tables. Keeping this mirror turns that into one 16-byte row gather.
+
+  Two choices here are load-bearing, both measured on a v5e-4 at
+  `num_actions=1393` over three shapes (medians, run-to-run spread <= 1.7%):
+
+    * Keeping a mirror at all. Reading `reward`/`discount` straight from
+      `children_rewards`/`children_discounts` needs a double-indexed gather into
+      the `[B, num_nodes, num_actions]` tables every hop, and ran 15-17% slower.
+    * Packing all four values into one row. The two indices are already in the
+      tree as `[B, num_nodes]` arrays, so mirroring only the two floats needs no
+      bit-level casts -- but it costs three gathers per hop instead of one, and
+      ran a further 2.8-3.9% slower.
+
+  Hence int32, with the two indices stored natively and the two floats held as
+  bit patterns for `_read_edge_record` to cast back. A single float32 mirror
+  would also avoid the bitcasts, but converting the indices is lossy above
+  2**24: `action` is bounded only by `num_actions`, which mctx does not cap.
+  """
+  # No shape asserts here. This runs immediately after `_write_nodes_batched`
+  # on the same index arrays, which validates them, and `edge_rec` is allocated
+  # by this module rather than supplied by a caller.
+  def as_bits(x):
+    return jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.int32)
+
+  record = jnp.stack([
+      parent_index.astype(jnp.int32),
+      action.astype(jnp.int32),
+      as_bits(step.reward),
+      as_bits(step.discount),
+  ], axis=-1)
+  return edge_rec.at[batch_index, node_index].set(record)
+
+
+def _read_edge_record(
+    edge_rec: chex.Array,
+    batch_index: chex.Array,
+    node_index: chex.Array) -> Tuple[chex.Array, ...]:
+  """Reads `(parent, action, reward, discount)` for `node_index` in one gather.
+
+  The inverse of `_write_edge_record`: one row gather, then four bitcasts of the
+  stored bit patterns back to their original dtypes.
+  """
+  row = edge_rec[batch_index, node_index]
+
+  def as_float(x):
+    return jax.lax.bitcast_convert_type(x, jnp.float32)
+
+  return row[..., 0], row[..., 1], as_float(row[..., 2]), as_float(row[..., 3])
+
+
+def _backward_batched(tree, edge_rec, leaf_indices, num_hops):
+  """mctx.search.backward for K leaves per batch row at once.
+
+  Structure and naming deliberately mirror mctx PR #116 (`path_*` arrays
+  recorded in the loop carry, then ONE scatter per tree array with
+  `mode="drop"` for unused slots) so this reads as that function generalized
+  to K lanes. The generalization is forced by round batching: K lanes share
+  the root, so visit counts must be scatter-ADDs rather than #116's `.set()`,
+  and the root value uses the associative closed form. In exchange, the path
+  scan is bounded by a static `num_hops` (a leaf expanded in round r is at
+  depth <= r+1) instead of `[num_nodes]` scratch.
+
+  Walks all `[B, K]` lanes leaf->root in lockstep for `num_hops` hops
+  (a static bound on the max leaf depth this round), recording per hop the
+  (parent, action, propagated leaf_value, updated child value). The K paths
+  are disjoint except at the root, so:
+
+    * non-root `node_values` and `children_values` follow mctx's exact
+      single-visitor expressions (bitwise identical on-schedule);
+    * visit counts are scatter-adds (exact, integer);
+    * the root value uses the associative closed form
+      (v*n + sum_k leaf_k) / (n + K), equal to mctx's K sequential
+      incremental means up to fp summation order.
+
+  Lanes whose paths are shorter than `num_hops` are masked by routing their
+  scatter indices out of bounds (`mode="drop"`).
+  """
+  batch_size = leaf_indices.shape[0]
+  num_nodes = tree.node_values.shape[1]
+  b_idx = jnp.arange(batch_size)[:, None]  # [B, 1], broadcasts over K
+
+  node_values = tree.node_values
+  node_visits = tree.node_visits
+  # packed (value, visits) snapshot: one row gather per hop instead of two
+  # element gathers (visits <= num_simulations are exact in f32).
+  vv_snap = jnp.stack(
+      [node_values, node_visits.astype(jnp.float32)], axis=-1)  # [B, N, 2]
+
+  def hop(carry, _):
+    index, leaf_value, child_value, active = carry  # each [B, K]
+    parent, action, reward, discount = _read_edge_record(
+        edge_rec, b_idx, index)
+    leaf_value = reward + discount * leaf_value
+    is_root = parent == Tree.ROOT_INDEX
+    record = (parent, action, leaf_value, child_value, active)
+    # The parent's updated value: only this lane touches a non-root parent,
+    # so this matches mctx's (v*count + leaf_value) / (count + 1) exactly.
+    # It becomes the NEXT hop's children_values write (mctx writes
+    # tree.node_values[index] *after* the previous hop updated it).
+    vv = vv_snap[b_idx, parent]  # [B, K, 2]
+    count = vv[..., 1]
+    parent_value = (vv[..., 0] * count + leaf_value) / (count + 1.0)
+    carry = (parent, leaf_value, parent_value,
+             jnp.logical_and(active, ~is_root))
+    return carry, record
+
+  init = (
+      leaf_indices,
+      node_values[b_idx, leaf_indices],  # backward starts from the leaf value
+      node_values[b_idx, leaf_indices],  # first children_values write
+      jnp.ones(leaf_indices.shape, dtype=bool),
+  )
+  _, (path_parents, path_actions, path_leaf_values, path_children_values,
+      path_active) = jax.lax.scan(hop, init, None,
+                                  length=num_hops)  # each [H, B, K]
+
+  # Flatten hops x lanes; mask by sending dropped entries out of bounds
+  # (masked parents can be NO_PARENT == -1, which would WRAP, so this is
+  # required for correctness, not just hygiene).
+  mask = path_active.reshape(-1)
+  parents = jnp.where(mask, path_parents.reshape(-1), num_nodes)
+  actions = path_actions.reshape(-1)
+  bat = jnp.broadcast_to(b_idx[None, :, :], path_active.shape).reshape(-1)
+  leaf_v = path_leaf_values.reshape(-1)
+  child_v = path_children_values.reshape(-1)
+  one = jnp.ones((), dtype=tree.children_visits.dtype)
+
+  # Per-node visit increments and leaf_value sums (root gets all K lanes,
+  # non-root nodes exactly one on-schedule). One packed [B, N, 2] scatter
+  # instead of two: counts <= num_simulations are exact in f32, so the
+  # unpacked columns are bitwise what the two separate scatters produced.
+  acc = jnp.zeros(node_values.shape + (2,),
+                  node_values.dtype).at[bat, parents].add(jnp.stack(
+                      [jnp.ones_like(leaf_v), leaf_v], axis=-1),
+                                                          mode="drop")
+  cnt = acc[..., 0].astype(node_visits.dtype)
+  leaf_sum = acc[..., 1]
+  new_node_values = jnp.where(cnt > 0, (node_values * node_visits + leaf_sum) /
+                              (node_visits + cnt), node_values)
+
+  return tree.replace(
+      node_values=new_node_values,
+      node_visits=node_visits + cnt,
+      children_values=tree.children_values.at[bat, parents,
+                                              actions].set(child_v,
+                                                           mode="drop"),
+      children_visits=tree.children_visits.at[bat, parents,
+                                              actions].add(one, mode="drop"),
+  )
+
+
+def _completed_q_and_score_subset(tree,
+                                  batch_range,
+                                  considered,
+                                  gumbel,
+                                  prior,
+                                  considered_visit,
+                                  logit_max_full,
+                                  value_scale=0.1,
+                                  maxvisit_init=50.0,
+                                  epsilon=1e-8):
+  """Bit-identical `score_considered(considered_visit, ...)` over a column
+  subset, for the DEFAULT `qtransform_completed_by_mix_value`
+  (value_scale=0.1,
+  maxvisit_init=50, rescale_values=True, use_mixed_value=True, epsilon=1e-8).
+
+  Rounds 1+ of Sequential Halving only ever consider actions with
+  `visit == considered_visit >= 1`; those are always a subset of the round-0
+  top-m `considered` set (the only root actions the search ever visits), and
+  every other action scores `-inf` (score_considered's penalty) so it can
+  never enter the top-k. So the full-1393-wide `vmap(qtransform)` +
+  `score_considered` collapse to work over the `[B, m]` `considered` columns.
+
+  Reproduces mctx's global terms from the subset (see qtransforms.py):
+    * root prior softmax and gumbel are STATIC across rounds; passed in
+      already gathered at `considered`.
+    * every `considered` action stays visited>0 the whole search, so the
+      completed array is {qvalue[considered]} plus the mixed value at the
+      (always >= 1, since 1393 >> m) unvisited actions; hence the full-width
+      rescale min/max reduce to min/max over (qvalue[considered], mixed) and
+      `max(visit_counts)` reduces to the max over `considered`.
+    * score_considered subtracts the FULL-width logit max (`logit_max_full`).
+  """
+  b = batch_range[:, None]
+  # qvalues over the considered columns: rewards + discount * value at ROOT.
+  q = (tree.children_rewards[b, Tree.ROOT_INDEX, considered] +
+       tree.children_discounts[b, Tree.ROOT_INDEX, considered] *
+       tree.children_values[b, Tree.ROOT_INDEX, considered])  # [B, m]
+  visits = tree.children_visits[b, Tree.ROOT_INDEX, considered]  # [B, m]
+  raw_value = tree.raw_values[:, Tree.ROOT_INDEX]  # [B]
+
+  # _compute_mixed_value over the subset (all considered actions are visited,
+  # so `where(visit>0, .)` masks are all-true on the subset).
+  sum_visit_counts = jnp.sum(visits, axis=-1)  # [B]
+  prior = jnp.maximum(jnp.finfo(prior.dtype).tiny, prior)
+  sum_probs = jnp.sum(prior, axis=-1)  # [B]
+  weighted_q = jnp.sum(
+      prior * q / jnp.where(sum_probs[:, None] > 0, sum_probs[:, None], 1.0),
+      axis=-1)
+  mixed = (raw_value + sum_visit_counts * weighted_q) / (sum_visit_counts + 1)
+
+  # _rescale_qvalues: min/max over the full completed array = min/max over
+  # (qvalue[considered], mixed), since all other (unvisited) actions complete
+  # to `mixed` and there is always >= 1 unvisited action (1393 >> m).
+  min_value = jnp.minimum(jnp.min(q, axis=-1), mixed)[:, None]
+  max_value = jnp.maximum(jnp.max(q, axis=-1), mixed)[:, None]
+  rescaled = (q - min_value) / jnp.maximum(max_value - min_value, epsilon)
+  maxvisit = jnp.max(visits, axis=-1)  # [B]
+  visit_scale = (maxvisit_init + maxvisit)[:, None]
+  completed_q = visit_scale * value_scale * rescaled  # [B, m]
+
+  # score_considered over the subset (full-width logit max already given).
+  logits_norm = tree.children_prior_logits[b, Tree.ROOT_INDEX, considered] \
+      - logit_max_full[:, None]
+  penalty = jnp.where(visits == considered_visit, 0.0, -jnp.inf)
+  return jnp.maximum(-1e9, gumbel + logits_norm + completed_q) + penalty
+
+
+def _make_forced_simulate(interior_fn):
+  """A vmapped tree-descent like mctx.search.simulate, but the depth-0 (root)
+  action is a per-batch input instead of coming from a selection function —
+  the round's considered action. Body mirrors mctx._src.search.simulate.
+
+  Doubly vmapped `[K, B]`: descent is read-only on the round's tree snapshot
+  and the K considered subtrees are disjoint below the root (the root action
+  is forced), so all K lanes run one lockstep while_loop over a broadcast
+  tree instead of K sequential descents.
+  """
+
+  @functools.partial(jax.vmap, in_axes=[0, None, 0, None], out_axes=0)  # K
+  @functools.partial(jax.vmap, in_axes=[0, 0, 0, None], out_axes=0)  # B
+  def simulate_forced(rng_key, tree, forced_action, max_depth):
+    # NOTE: gumbel interior selection is deterministic (mctx deletes the
+    # key), so no per-hop rng split is carried — the old per-hop
+    # jax.random.split was a [K, B]-wide threefry chain per hop feeding a
+    # deleted argument (pure dispatch waste, visible in traces as 8-byte
+    # slice/threefry ops). `rng_key` stays in the signature so callers'
+    # key-stream consumption (and thus all search outputs) is unchanged.
+    def selection_fn(t, node_index, depth):
+      interior = interior_fn(rng_key, t, node_index, depth)
+      return jnp.where(depth == 0, forced_action, interior).astype(jnp.int32)
+
+    def cond_fun(state):
+      return state["is_continuing"]
+
+    def body_fun(state):
+      node_index = state["next_node_index"]
+      action = selection_fn(tree, node_index, state["depth"])
+      next_node_index = tree.children_index[node_index, action]
+      depth = state["depth"] + 1
+      return {
+          "node_index":
+              node_index,
+          "action":
+              action,
+          "next_node_index":
+              next_node_index,
+          "depth":
+              depth,
+          "is_continuing":
+              jnp.logical_and(next_node_index != Tree.UNVISITED, depth
+                              < max_depth),
+      }
+
+    root_index = jnp.array(Tree.ROOT_INDEX, dtype=jnp.int32)
+    state = {
+        "node_index": jnp.full((), Tree.NO_PARENT, jnp.int32),
+        "action": jnp.full((), Tree.NO_PARENT, jnp.int32),
+        "next_node_index": root_index,
+        "depth": jnp.zeros((), jnp.int32),
+        "is_continuing": jnp.array(True),
+    }
+    end = jax.lax.while_loop(cond_fun, body_fun, state)
+    return end["node_index"], end["action"]
+
+  return simulate_forced
+
+
+def batched_gumbel_muzero_policy(
+    params: base.Params,
+    rng_key: chex.PRNGKey,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
+    num_simulations: int,
+    invalid_actions: Optional[chex.Array] = None,
+    max_depth: Optional[int] = None,
+    loop_fn: base.LoopFn = jax.lax.fori_loop,
+    *,
+    qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
+    max_num_considered_actions: int = 16,
+    gumbel_scale: chex.Numeric = 1.,
+    scan_fn: base.ScanFn = jax.lax.scan,
+    max_lanes_per_call: Optional[int] = None,
+) -> base.PolicyOutput[action_selection.GumbelMuZeroExtraData]:
+  """Runs wave-parallel Gumbel MuZero search and returns the `PolicyOutput`.
+
+  A drop-in alternative to `gumbel_muzero_policy` that builds the same tree
+  with far fewer `recurrent_fn` calls. Sequential Halving visits root actions
+  in rounds: consecutive simulations sharing a considered-visit level visit
+  distinct root actions, and their subtrees are disjoint below the root, so
+  they are independent. This policy run-length-encodes the same visit schedule
+  into `(considered_visit, width)` rounds and evaluates each round with one
+  `recurrent_fn` call. Rounds sharing a width run under a single `scan_fn`, so
+  the graph size stays nearly flat as `num_simulations` grows.
+
+  Numerical equivalence to `gumbel_muzero_policy`:
+
+    * node allocation, non-root backups and visit counts are bitwise
+      identical; the root's count-weighted mean uses the associative closed
+      form `(v * n + sum_k leaf_k) / (n + width)`, so it differs only in
+      floating-point summation order. Root selection reads `raw_values` and
+      the children statistics rather than `node_values`, so that reordering
+      cannot change which actions are visited.
+    * with a drift-free `qtransform` (`value_scale=0`, so root scores do not
+      depend on backed-up Q-values) the visit counts and the chosen action
+      match exactly.
+    * with the default `qtransform` two documented differences remain. First,
+      `gumbel_muzero_policy` shrinks its schedule per row via
+      `min(max_num_considered_actions, num_valid_actions)`; rounds here have a
+      static width, so a row with fewer valid actions re-visits its best valid
+      action for the surplus slots. Second, `gumbel_muzero_policy` recomputes
+      the completed Q-values after every simulation, so within a halving round
+      its sequential argmax can pick a different subset than this round-start
+      `top_k` when candidates are near-tied. There are at most
+      `ceil(log2(max_num_considered_actions)) - 1` such rounds -- those
+      where the considered set shrinks -- and that count does not grow with
+      the simulation budget, while the total number of rounds does. Every
+      other round is order-independent: rounds that visit each eligible
+      candidate have no subset to choose, and round 0 leaves every action
+      unvisited, which makes the completed Q-values identically zero and
+      the scores static.
+
+  `recurrent_fn` must be shape-polymorphic in its leading (batch) dimension:
+  it is called with batch `B * width` instead of `B`, where `width` is the
+  number of root actions visited in the round. Any vmapped `recurrent_fn`
+  (the common case) satisfies this.
+
+  Args:
+    params: params to be forwarded to root and recurrent functions.
+    rng_key: random number generator state, the key is consumed.
+    root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
+      `prior_logits` are from a policy network. The shapes are
+      `([B, num_actions], [B], [B, ...])`, respectively.
+    recurrent_fn: a callable to be called on the leaf nodes and unvisited
+      actions retrieved by the simulation step, which takes as args
+      `(params, rng_key, action, embedding)` and returns a
+      `RecurrentFnOutput` and the new state embedding. It is called once per
+      round with a batch of `B * width`.
+    num_simulations: the number of simulations.
+    invalid_actions: a mask with invalid actions. Invalid actions have ones,
+      valid actions have zeros in the mask. Shape `[B, num_actions]`.
+    max_depth: maximum search tree depth allowed during simulation.
+    loop_fn: accepted for signature parity with `gumbel_muzero_policy`. This
+      policy has no per-simulation `fori_loop` to parameterize — the budget is
+      consumed by `scan_fn` over rounds — so passing a non-default value is an
+      error rather than being silently ignored. Use `scan_fn` instead.
+    qtransform: function to obtain completed Q-values for a node.
+    max_num_considered_actions: the maximum number of actions expanded at the
+      root node. A smaller number of actions will be expanded if the number of
+      valid actions is smaller.
+    gumbel_scale: scale for the Gumbel noise. Evalution on perfect-information
+      games can use gumbel_scale=0.0.
+    scan_fn: function used to run the rounds, with the interface of
+      `jax.lax.scan`. Pass `hk.scan` when calling this policy inside a Haiku
+      module, for the same reason `LoopFn` exists for `hk.fori_loop`.
+    max_lanes_per_call: if set, an upper bound on how many root actions share
+      a single `recurrent_fn` call. A round of `width` actions is then split
+      into `ceil(width / max_lanes_per_call)` sequential calls of at most
+      `[B * max_lanes_per_call]`. Use this when the `w`-fold larger batch
+      would exhaust accelerator memory; `max_lanes_per_call=1` reproduces
+      `gumbel_muzero_policy`'s per-call memory profile. Every chunk receives
+      the same `rng_key`, exactly as the unsplit call does, so chunking is
+      exact for any `recurrent_fn` that does not draw shape-dependent noise.
+
+  Returns:
+    `PolicyOutput` containing the proposed action, action_weights and the used
+    search tree.
+  """
+  if loop_fn is not jax.lax.fori_loop:
+    raise ValueError(
+        "batched_gumbel_muzero_policy has no per-simulation fori_loop to "
+        "parameterize: the simulation budget is consumed by `scan_fn` over "
+        "halving rounds instead. Pass scan_fn=hk.scan for Haiku-compatible "
+        "control flow.")
+  batch_size = root.value.shape[0]
+  num_actions = root.prior_logits.shape[-1]
+  if invalid_actions is None:
+    invalid_actions = jnp.zeros_like(root.prior_logits)
+  if max_depth is None:
+    max_depth = num_simulations
+
+  # Same masking + gumbel sampling (and rng consumption order) as mctx, so
+  # results are directly comparable under the same rng_key.
+  root = root.replace(prior_logits=action_selection.mask_invalid_actions(
+      root.prior_logits, invalid_actions))
+  rng_key, gumbel_rng = jax.random.split(rng_key)
+  gumbel = gumbel_scale * jax.random.gumbel(
+      gumbel_rng, shape=root.prior_logits.shape, dtype=root.prior_logits.dtype)
+
+  extra_data = action_selection.GumbelMuZeroExtraData(root_gumbel=gumbel)
+  tree = search.instantiate_tree_from_root(root,
+                                           num_simulations,
+                                           root_invalid_actions=invalid_actions,
+                                           extra_data=extra_data)
+  edge_rec = jnp.zeros((batch_size, num_simulations + 1, 4), jnp.int32)
+
+  interior_fn = functools.partial(
+      action_selection.gumbel_muzero_interior_action_selection,
+      qtransform=qtransform)
+  simulate_forced = _make_forced_simulate(interior_fn)
+  batch_range = jnp.arange(batch_size)
+  # Clamp to the action count before building the schedule. `top_k(., width)`
+  # requires width <= num_actions, and mctx does the analogous thing per row
+  # (`num_considered = min(max_num_considered_actions, num_valid_actions)`
+  # indexes a different row of its schedule table). Clamping here keeps
+  # `max_num_considered_actions > num_actions` working, and makes that case
+  # agree with mctx rather than failing.
+  num_considered = min(max_num_considered_actions, num_actions)
+  rounds = _rounds_from_schedule(num_considered, num_simulations)
+
+  # Fast subset path is only exercised for the default completed-by-mix-value
+  # qtransform with default params (see _completed_q_and_score_subset). For
+  # any other qtransform we keep the general full-width vmap(qtransform) path.
+  use_subset = qtransform is qtransforms.qtransform_completed_by_mix_value
+  # Root priors and their softmax never change during search -> static.
+  root_logits = tree.children_prior_logits[:, Tree.ROOT_INDEX]  # [B, 1393]
+  logit_max_full = jnp.max(root_logits, axis=-1)  # [B]
+  prior_full = jax.nn.softmax(root_logits, axis=-1)  # [B, 1393]
+
+  def _apply_fallback(top_actions):
+    # Rows with fewer valid actions than the schedule expects: fall back to
+    # the row's best action (top-1 is always valid when any action is).
+    selected_invalid = jnp.take_along_axis(invalid_actions, top_actions,
+                                           axis=1).astype(bool)
+    return jnp.where(selected_invalid, top_actions[:, :1], top_actions)
+
+  def _score_full_width(tree_, considered_visit):
+    """mctx's own root scoring at full action width. Used for round 0 and
+    for any qtransform other than the default (where the O(m) subset
+    derivation in `_completed_q_and_score_subset` does not apply)."""
+    summary_visits = tree_.children_visits[:, Tree.ROOT_INDEX]
+    completed_q = jax.vmap(qtransform, in_axes=[0, None])(tree_,
+                                                          Tree.ROOT_INDEX)
+    return seq_halving.score_considered(considered_visit, gumbel, root_logits,
+                                        completed_q, summary_visits)
+
+  def _run_round(tree_, edge_rec_, rng_key_, sim_offset_, considered_visit,
+                 width, num_hops, subset_state):
+    """One halving round. `width` and `num_hops` must be STATIC (they set
+    array shapes and the backward scan length); `considered_visit` and
+    `sim_offset_` may be traced, which is what lets same-width rounds share
+    one traced body under `lax.scan`."""
+    if subset_state is None:
+      scores = _score_full_width(tree_, considered_visit)
+    else:
+      # Rounds 1+: only actions with `visit == considered_visit >= 1` are
+      # eligible, always a subset of the round-0 `considered` set (the only
+      # actions the search ever visits); every other action scores -inf.
+      # So the O(num_actions) qtransform/softmax/score work is done over
+      # just the `considered` columns, then scattered into a full-width
+      # -inf score array so the O(num_actions) top_k reproduces mctx's
+      # exact fill/tie-break for the off-schedule rows too.
+      considered_, considered_prior_, gumbel_sub_ = subset_state
+      scores_sub = _completed_q_and_score_subset(tree_, batch_range,
+                                                 considered_, gumbel_sub_,
+                                                 considered_prior_,
+                                                 considered_visit,
+                                                 logit_max_full)  # [B, m]
+      scores = jnp.full((batch_size, num_actions),
+                        -jnp.inf,
+                        dtype=scores_sub.dtype)
+      scores = scores.at[batch_range[:, None], considered_].set(scores_sub)
+    _, top_actions = jax.lax.top_k(scores, width)  # [B, width]
+    top_actions = _apply_fallback(top_actions)
+
+    # --- descend all K considered subtrees at once (read-only, disjoint
+    # below the root): one lockstep [K, B] while_loop.
+    rng_key_, simulate_rng = jax.random.split(rng_key_)
+    simulate_keys = jax.random.split(simulate_rng, width * batch_size)
+    simulate_keys = simulate_keys.reshape((width, batch_size) +
+                                          simulate_keys.shape[1:])
+    parent_kb, action_kb = simulate_forced(simulate_keys, tree_, top_actions.T,
+                                           max_depth)  # [K, B]
+    parents = parent_kb.T  # [B, K]
+    actions = action_kb.T
+    next_idxs = tree_.children_index[batch_range[:, None], parents, actions]
+    next_idxs = jnp.where(next_idxs == Tree.UNVISITED, sim_offset_ +
+                          jnp.arange(width, dtype=next_idxs.dtype)[None, :] + 1,
+                          next_idxs)  # [B, K]
+
+    # --- ONE batched recurrent_fn call for the whole round: [B * width],
+    # optionally split into ceil(width / chunk) calls of at most
+    # [B * chunk] to bound peak activation memory (see max_lanes_per_call).
+    parents_f = parents.reshape(-1)  # b-major
+    actions_f = actions.reshape(-1)
+    next_f = next_idxs.reshape(-1)
+    batch_f = jnp.repeat(batch_range, width)
+    rng_key_, expand_key = jax.random.split(rng_key_)
+    chunk = width if max_lanes_per_call is None else max(
+        1, min(width, max_lanes_per_call))
+    if chunk >= width:
+      embedding_f = jax.tree_util.tree_map(lambda x: x[batch_f, parents_f],
+                                           tree_.embeddings)
+      step, new_embedding_f = recurrent_fn(params, expand_key, actions_f,
+                                           embedding_f)
+    else:
+
+      def _as_bk(obj, lanes):
+        return jax.tree_util.tree_map(
+            lambda y: y.reshape((batch_size, lanes) + y.shape[1:]), obj)
+
+      def _join(parts):
+        return jax.tree_util.tree_map(
+            lambda *ys: jnp.concatenate(ys, axis=1).reshape(
+                (-1,) + ys[0].shape[2:]), *parts)
+
+      step_parts, emb_parts = [], []
+      for lo in range(0, width, chunk):
+        hi = min(lo + chunk, width)
+        bf_c = jnp.repeat(batch_range, hi - lo)
+        pf_c = parents[:, lo:hi].reshape(-1)
+        af_c = actions[:, lo:hi].reshape(-1)
+        emb_c = jax.tree_util.tree_map(
+            lambda x, b=bf_c, q=pf_c: x[b, q], tree_.embeddings)
+        # The SAME expand_key goes to every chunk, which is what the
+        # single [B * width] call does; chunking is therefore exact for
+        # any recurrent_fn that does not draw shape-dependent noise.
+        step_c, emb_out_c = recurrent_fn(params, expand_key, af_c, emb_c)
+        step_parts.append(_as_bk(step_c, hi - lo))
+        emb_parts.append(_as_bk(emb_out_c, hi - lo))
+      step = _join(step_parts)
+      new_embedding_f = _join(emb_parts)
+
+    # --- write the round's K nodes with ONE scatter per tree array.
+    tree_ = _write_nodes_batched(tree_, batch_f, parents_f, actions_f, next_f,
+                                 step, new_embedding_f)
+    edge_rec_ = _write_edge_record(edge_rec_, batch_f, parents_f, actions_f,
+                                   next_f, step)
+    # --- back up all K lanes at once.
+    tree_ = _backward_batched(tree_, edge_rec_, next_idxs, num_hops)
+    sim_offset_ = jnp.asarray(sim_offset_ + width, jnp.int32)
+    return tree_, edge_rec_, rng_key_, sim_offset_, top_actions
+
+  # ---- Round 0, PEELED from the scan. Two reasons it cannot share a body:
+  # (a) no root children exist yet, so it must take the full-width path
+  #     (`completed_q` is identically 0 there — every action completes to the
+  #     mixed value and the rescale maps a constant array to 0 — so scores
+  #     reduce to gumbel + normalized logits);
+  # (b) it establishes the `considered` bookkeeping every later round reuses,
+  #     and its width can equal a later round's width.
+  cv0, w0 = rounds[0]
+  tree, edge_rec, rng_key, sim_offset, top0 = _run_round(
+      tree, edge_rec, rng_key, jnp.int32(0), cv0, w0, min(1, max_depth), None)
+  subset_state = None
+  if use_subset:
+    # Sort by action id so duplicate ids from the fallback map to adjacent
+    # columns (harmless: duplicates carry equal scores, so the round 1+
+    # scatter into the full-width score array is deterministic regardless
+    # of which duplicate wins the `.set`).
+    considered = jnp.sort(top0, axis=-1)  # [B, m]
+    subset_state = (considered,
+                    jnp.take_along_axis(prior_full, considered, axis=1),
+                    jnp.take_along_axis(gumbel, considered, axis=1))
+
+  # ---- Remaining rounds: consecutive same-width runs share ONE traced body.
+  # The halving schedule's widths are non-increasing, so same-width rounds are
+  # always consecutive and grouping-by-run == grouping-by-width. This keeps HLO
+  # size (hence compile time) flat as the simulation budget grows: at
+  # (n=800, m=32) the 154 remaining round bodies collapse to 4 scanned ones
+  # instead of 154 unrolled copies.
+  groups = []  # [width, [considered_visit, ...], last_round_index]
+  for ri, (cv, w) in enumerate(rounds[1:], start=1):
+    if groups and groups[-1][0] == w:
+      groups[-1][1].append(cv)
+      groups[-1][2] = ri
+    else:
+      groups.append([w, [cv], ri])
+
+  for width, cvs, last_ri in groups:
+    # ONE static hop bound for the whole group, taken from its deepest round
+    # (a leaf expanded in round r is at depth <= r+1, since each considered
+    # subtree gains at most one node per round). Over-running the walk is
+    # EXACT — lanes deactivate at the root and their records are dropped by
+    # the masked scatter — it only costs a few extra [B, K] gathers on the
+    # group's earlier rounds.
+    num_hops = min(last_ri + 1, max_depth)
+
+    def round_body(carry, considered_visit, rw=width, rh=num_hops):
+      t_, e_, k_, off_ = carry
+      t_, e_, k_, off_, _ = _run_round(t_, e_, k_, off_, considered_visit, rw,
+                                       rh, subset_state)
+      return (t_, e_, k_, off_), None
+
+    (tree, edge_rec, rng_key,
+     sim_offset), _ = scan_fn(round_body, (tree, edge_rec, rng_key, sim_offset),
+                              jnp.asarray(cvs, dtype=jnp.int32))
+
+  # --- outputs: verbatim mctx.policies.gumbel_muzero_policy tail.
+  summary = tree.summary()
+  considered_visit = jnp.max(summary.visit_counts, axis=-1, keepdims=True)
+  completed_qvalues = jax.vmap(qtransform, in_axes=[0, None])(tree,
+                                                              Tree.ROOT_INDEX)
+  to_argmax = seq_halving.score_considered(considered_visit, gumbel,
+                                           root.prior_logits, completed_qvalues,
+                                           summary.visit_counts)
+  action = action_selection.masked_argmax(to_argmax, invalid_actions)
+  completed_search_logits = action_selection.mask_invalid_actions(
+      root.prior_logits + completed_qvalues, invalid_actions)
+  action_weights = jax.nn.softmax(completed_search_logits)
+  return base.PolicyOutput(action=action,
+                           action_weights=action_weights,
+                           search_tree=tree)

@@ -28,7 +28,9 @@ from mctx._src.base import RecurrentFnOutput
 from mctx._src.base import RecurrentState
 from mctx._src.base import RootActionSelectionFn
 from mctx._src.base import RootFnOutput
+from mctx._src.base import ScanFn
 from mctx._src.policies import gumbel_muzero_policy
+from mctx._src.policies_batched import batched_gumbel_muzero_policy
 from mctx._src.policies import muzero_policy
 from mctx._src.policies import stochastic_muzero_policy
 from mctx._src.qtransforms import qtransform_by_min_max
@@ -51,7 +53,9 @@ __all__ = (
     "RecurrentState",
     "RootActionSelectionFn",
     "RootFnOutput",
+    "ScanFn",
     "Tree",
+    "batched_gumbel_muzero_policy",
     "gumbel_muzero_interior_action_selection",
     "gumbel_muzero_policy",
     "gumbel_muzero_root_action_selection",

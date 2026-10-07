@@ -87,7 +87,8 @@ def muzero_policy(
           dirichlet_fraction=dirichlet_fraction,
           dirichlet_alpha=dirichlet_alpha))
   root = root.replace(  # pyrefly: ignore[missing-attribute]
-      prior_logits=_mask_invalid_actions(noisy_logits, invalid_actions))
+      prior_logits=action_selection.mask_invalid_actions(
+          noisy_logits, invalid_actions))
 
   # Running the search.
   interior_action_selection_fn = functools.partial(
@@ -177,7 +178,8 @@ def gumbel_muzero_policy(
   """
   # Masking invalid actions.
   root = root.replace(  # pyrefly: ignore[missing-attribute]
-      prior_logits=_mask_invalid_actions(root.prior_logits, invalid_actions))
+      prior_logits=action_selection.mask_invalid_actions(
+          root.prior_logits, invalid_actions))
 
   # Generating Gumbel.
   rng_key, gumbel_rng = jax.random.split(rng_key)
@@ -222,7 +224,7 @@ def gumbel_muzero_policy(
   action = action_selection.masked_argmax(to_argmax, invalid_actions)
 
   # Producing action_weights usable to train the policy network.
-  completed_search_logits = _mask_invalid_actions(
+  completed_search_logits = action_selection.mask_invalid_actions(
       root.prior_logits + completed_qvalues, invalid_actions)
   action_weights = jax.nn.softmax(completed_search_logits)
   return base.PolicyOutput(
@@ -302,7 +304,8 @@ def stochastic_muzero_policy(
           dirichlet_alpha=dirichlet_alpha))
 
   root = root.replace(  # pyrefly: ignore[missing-attribute]
-      prior_logits=_mask_invalid_actions(noisy_logits, invalid_actions))
+      prior_logits=action_selection.mask_invalid_actions(
+          noisy_logits, invalid_actions))
 
   # construct a dummy afterstate embedding
   batch_size = jax.tree_util.tree_leaves(root.embedding)[0].shape[0]
@@ -369,19 +372,6 @@ def stochastic_muzero_policy(
   action = jax.random.categorical(rng_key, action_logits)
   return base.PolicyOutput(
       action=action, action_weights=action_weights, search_tree=search_tree)
-
-
-def _mask_invalid_actions(logits, invalid_actions):
-  """Returns logits with zero mass to invalid actions."""
-  if invalid_actions is None:
-    return logits
-  chex.assert_equal_shape([logits, invalid_actions])
-  logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-  # At the end of an episode, all actions can be invalid. A softmax would then
-  # produce NaNs, if using -inf for the logits. We avoid the NaNs by using
-  # a finite `min_logit` for the invalid actions.
-  min_logit = jnp.finfo(logits.dtype).min
-  return jnp.where(invalid_actions, min_logit, logits)
 
 
 def _get_logits_from_probs(probs):
